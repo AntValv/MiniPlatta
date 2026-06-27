@@ -3,11 +3,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 
-const { createRuntimeForQuestionMap } = require('./runtime');
 const { discoverScripts } = require('./scripts');
 const { questionMapFromQuestionnaireResponse } = require('./fhir');
+const { runScriptForQuestionMap } = require('./engine');
 const { listCollectionFiles, loadCollectionRequests, parseFhirBody, extractAssertions } = require('./postman');
 
 const ROOT = path.join(__dirname, '..');
@@ -16,34 +15,9 @@ function loadJSON(p) {
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
-function buildSandbox(runtime) {
-  return {
-    libEBMEDS: runtime.libEBMEDS,
-    libQuestions: runtime.libQuestions,
-    libUser: runtime.libUser,
-    libDiagnoses: runtime.libDiagnoses,
-    libMeasurements: runtime.libMeasurements,
-    libMedication: runtime.libMedication,
-    libVaccinations: runtime.libVaccinations,
-    libProcedures: runtime.libProcedures,
-    libPatient: runtime.libPatient,
-    libRisks: runtime.libRisks,
-    libCommon: runtime.libCommon,
-    libSharedFunctions: runtime.libSharedFunctions,
-    reminder: runtime.reminder,
-    ebdeb: runtime.ebdeb,
-    console,
-  };
-}
-
 function runScenario({ scriptSrc, scriptPath, scriptId, items }) {
   const questionMap = questionMapFromQuestionnaireResponse(items);
-  const runtime = createRuntimeForQuestionMap(questionMap, 'fi');
-  const sandbox = buildSandbox(runtime);
-  vm.createContext(sandbox);
-  vm.runInContext(scriptSrc, sandbox, { filename: scriptPath });
-  sandbox[scriptId]();
-  return runtime.recommendations;
+  return runScriptForQuestionMap({ scriptSrc, scriptPath, scriptId, questionMap, language: 'fi' });
 }
 
 function resolveAgainstReminders(recommendations, reminderDefs) {

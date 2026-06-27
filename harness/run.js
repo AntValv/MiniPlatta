@@ -5,6 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const { createRuntime } = require('./runtime');
+const { buildSandbox } = require('./engine');
+const { resolveAgainstReminders } = require('./resolve');
 
 function readJSON(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -45,24 +47,7 @@ function runInferenceScript({ scriptPath, responsePath }) {
   const entryFunctionName = findEntryFunctionName(scriptSrc);
 
   const runtime = createRuntime(response);
-
-  const sandbox = {
-    libEBMEDS: runtime.libEBMEDS,
-    libQuestions: runtime.libQuestions,
-    libUser: runtime.libUser,
-    libDiagnoses: runtime.libDiagnoses,
-    libMeasurements: runtime.libMeasurements,
-    libMedication: runtime.libMedication,
-    libVaccinations: runtime.libVaccinations,
-    libProcedures: runtime.libProcedures,
-    libPatient: runtime.libPatient,
-    libRisks: runtime.libRisks,
-    libCommon: runtime.libCommon,
-    libSharedFunctions: runtime.libSharedFunctions,
-    reminder: runtime.reminder,
-    ebdeb: runtime.ebdeb,
-    console,
-  };
+  const sandbox = buildSandbox(runtime);
 
   vm.createContext(sandbox);
   vm.runInContext(scriptSrc, sandbox, { filename: scriptPath });
@@ -73,35 +58,6 @@ function runInferenceScript({ scriptPath, responsePath }) {
   sandbox[entryFunctionName]();
 
   return runtime.recommendations;
-}
-
-// Fills "@1" in a reminder template string with the text produced by the script.
-function substitute(template, text) {
-  if (!template) return template || '';
-  return template.split('@1').join(text || '');
-}
-
-function resolveRecommendations(recommendations, reminderDefs) {
-  return recommendations.map((rec) => {
-    const def = reminderDefs.find((r) => r.scriptId === rec.scriptId && r.messageNumber === rec.messageNumber);
-    if (!def) {
-      return { ...rec, found: false };
-    }
-    // A reminder whose patientMessage is empty is professional/nurse-facing only
-    // (in this dataset that's exactly messageNumber 13, the case-summary reminder).
-    const isProfessionalOnly = !def.patientMessage;
-    return {
-      ...rec,
-      found: true,
-      isProfessionalOnly,
-      uuid: def.uuid,
-      longMessage: substitute(def.longMessage, rec.text),
-      shortMessage: substitute(def.shortMessage, rec.text),
-      nurseMessage: substitute(def.nurseMessage, rec.text),
-      patientMessage: substitute(def.patientMessage, rec.text),
-      suggestions: def.suggestions || [],
-    };
-  });
 }
 
 function printReport(resolved) {
@@ -140,7 +96,7 @@ function main() {
   const reminderDefs = readJSON(args.reminders);
 
   const recommendations = runInferenceScript({ scriptPath: args.script, responsePath: args.response });
-  const resolved = resolveRecommendations(recommendations, reminderDefs);
+  const resolved = resolveAgainstReminders(recommendations, reminderDefs);
 
   printReport(resolved);
 
@@ -151,4 +107,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main, runInferenceScript, resolveRecommendations };
+module.exports = { main, runInferenceScript, resolveRecommendations: resolveAgainstReminders };

@@ -8,6 +8,21 @@ function isUnanswered(question) {
   return choices.length === 0 || choices.every((c) => Number(c) === 0);
 }
 
+// Scripts only ever branch on the literal codes "fi"/"sv"/"en" (the
+// platform's three supported languages) and assume libUser.getLanguageCode()
+// always hands back one of those — the real platform presumably normalizes
+// whatever raw locale/UI value it received before scripts ever see it. Our
+// test data sources (response.user.language, the editor's feedback-container
+// dump) aren't guaranteed to already be in that clean form, so we normalize
+// here too: lowercase, drop any region suffix ("en-GB" -> "en"), and default
+// to "fi" — the platform's base language — for anything unrecognized.
+function normalizeLanguageCode(raw) {
+  const code = String(raw || '')
+    .toLowerCase()
+    .split(/[-_]/)[0];
+  return code === 'sv' || code === 'en' ? code : 'fi';
+}
+
 /**
  * Builds libQuestions + libUser on top of a question map: Map<string id, questionRecord>
  * where questionRecord = { answer: { type, value, choices, returnValue } }.
@@ -66,7 +81,7 @@ function buildQuestionLibs(getQuestionMap, language) {
 
   const libUser = {
     getLanguageCode() {
-      return language || 'fi';
+      return normalizeLanguageCode(language);
     },
   };
 
@@ -77,6 +92,10 @@ function buildQuestionLibs(getQuestionMap, language) {
 // implemented so far. Left as empty stubs on purpose: if a script calls a
 // method on one of these, it should fail loudly so the gap gets implemented,
 // rather than silently returning undefined.
+//
+// "reminder" is the odd one out: some scripts (e.g. scr01900 / form 153) treat
+// it as a pre-existing global string buffer they grow with "reminder += ..."
+// rather than a lib namespace, so its stub starts out as "" rather than {}.
 function unimplementedLibs() {
   return {
     libDiagnoses: {},
@@ -88,8 +107,110 @@ function unimplementedLibs() {
     libRisks: {},
     libCommon: {},
     libSharedFunctions: {},
-    reminder: {},
+    reminder: '',
     ebdeb: {},
+  };
+}
+
+// Some scripts (e.g. scr01900 / form 153) query an external "lifetime
+// cardiovascular risk" calculator that lives outside the normal libQuestions
+// data model and isn't even listed in the script's own /*global*/ comment.
+// We have no spec for its real algorithm, so this is a neutral stub: it never
+// crashes the script, but it also never produces a real risk figure. Pass
+// "overrides" (e.g. response.lifetimeRiskService in the test JSON) to supply
+// known values when a test scenario specifically needs to exercise the
+// risk-dependent branches.
+function buildLifetimeRiskService(overrides) {
+  const o = overrides || {};
+  const risks = o.risks || {};
+  function bucket(name) {
+    const r = risks[name] || {};
+    return { cases: r.cases || 0, chartValue: r.chartValue || 0 };
+  }
+  return {
+    getAgeRemainderSync() {
+      return o.additionalYears !== undefined ? o.additionalYears : 0;
+    },
+    getLifeTimeInformation() {
+      return {
+        ageRemainder: o.ageRemainder !== undefined ? o.ageRemainder : 0,
+        currentHealtyYears: o.currentHealtyYears !== undefined ? o.currentHealtyYears : 0,
+        currentLifetime: o.currentLifetime !== undefined ? o.currentLifetime : 0,
+        maxHealtyYears: o.maxHealtyYears !== undefined ? o.maxHealtyYears : 0,
+        maxLifetime: o.maxLifetime !== undefined ? o.maxLifetime : 0,
+      };
+    },
+    getRisks() {
+      return {
+        coronary: bucket('coronary'),
+        stroke: bucket('stroke'),
+        diabetes: bucket('diabetes'),
+        dementia: bucket('dementia'),
+        // Left undefined unless explicitly overridden, so the script's own
+        // "if (!risks.total)" guards trigger their built-in
+        // "STAR risk counter did not return any risks" fallback text instead
+        // of us fabricating a risk number we can't actually back up.
+        total: risks.total,
+      };
+    },
+  };
+}
+
+// Finds whichever argument to libEBMEDS.initScript(...) looks like "fmNNNN",
+// regardless of its position — different scripts pass (scriptId, country,
+// formCode) while others pass (scriptId, formCode, country).
+function extractFormNumber(args) {
+  const formArg = args.find((a) => /^fm\d+$/.test(a || ''));
+  return formArg ? formArg.slice(2) : null;
+}
+
+// createObservation/createRiskAssessment record structured clinical data as a
+// side effect (akin to FHIR Observation/RiskAssessment resources); scripts
+// never use their return value, so recording the call is enough to keep them
+// from crashing while still exposing what was recorded for inspection.
+//
+// createScriptReminder is a newer-style sibling of createScriptRecommendation
+// used by some scripts: no explicit scriptId argument (it's implicitly
+// whichever script is currently running, set via initScript), and its return
+// value is concatenated by the caller into a buffer
+// (`reminder += libEBMEDS.createScriptReminder(...)`) that later gets passed
+// to libEBMEDS.reminderStatistics(). We don't have the real
+// reminderStatistics implementation, so it's a passthrough stub — the
+// messageNumber/urgency/text we recorded is what the harness actually reports.
+function buildRecordingMethods() {
+  const recommendations = [];
+  const observations = [];
+  const riskAssessments = [];
+  let currentScriptId = null;
+  return {
+    recommendations,
+    observations,
+    riskAssessments,
+    setCurrentScriptId(scriptId) {
+      currentScriptId = scriptId;
+    },
+    createScriptRecommendation(scriptId, messageNumber, urgency, text) {
+      recommendations.push({
+        scriptId,
+        messageNumber,
+        urgency,
+        text: text === undefined || text === null ? '' : String(text),
+      });
+    },
+    createScriptReminder(messageNumber, urgency, text) {
+      const resolvedText = text === undefined || text === null ? '' : String(text);
+      recommendations.push({ scriptId: currentScriptId, messageNumber, urgency, text: resolvedText });
+      return resolvedText;
+    },
+    reminderStatistics(buffer) {
+      return buffer;
+    },
+    createObservation(observation) {
+      observations.push(observation);
+    },
+    createRiskAssessment(riskAssessment) {
+      riskAssessments.push(riskAssessment);
+    },
   };
 }
 
@@ -99,7 +220,17 @@ function unimplementedLibs() {
  * Everything is derived from a single "response" message (e.g. test_response.json).
  */
 function createRuntime(response) {
-  const recommendations = [];
+  const {
+    recommendations,
+    observations,
+    riskAssessments,
+    setCurrentScriptId,
+    createScriptRecommendation,
+    createScriptReminder,
+    reminderStatistics,
+    createObservation,
+    createRiskAssessment,
+  } = buildRecordingMethods();
   let questionMap = new Map();
 
   function setActiveQuestionnaire(questionnaire) {
@@ -115,9 +246,9 @@ function createRuntime(response) {
   );
 
   const libEBMEDS = {
-    initScript(scriptId, country, formCode) {
-      const match = /^fm(\d+)$/.exec(formCode || '');
-      const formNumber = match ? match[1] : null;
+    initScript(scriptId, ...args) {
+      setCurrentScriptId(scriptId);
+      const formNumber = extractFormNumber(args);
       const questionnaires =
         (response.patient && response.patient.investigations && response.patient.investigations.questionnaires) || [];
       const questionnaire = questionnaires.find((qq) => qq.code && String(qq.code.value) === formNumber);
@@ -128,21 +259,21 @@ function createRuntime(response) {
       return true;
     },
 
-    createScriptRecommendation(scriptId, messageNumber, urgency, text) {
-      recommendations.push({
-        scriptId,
-        messageNumber,
-        urgency,
-        text: text === undefined || text === null ? '' : String(text),
-      });
-    },
+    createScriptRecommendation,
+    createScriptReminder,
+    reminderStatistics,
+    createObservation,
+    createRiskAssessment,
   };
 
   return {
     recommendations,
+    observations,
+    riskAssessments,
     libEBMEDS,
     libQuestions,
     libUser,
+    lifetimeRiskService: buildLifetimeRiskService(response.lifetimeRiskService),
     ...unimplementedLibs(),
   };
 }
@@ -152,29 +283,40 @@ function createRuntime(response) {
  * FHIR QuestionnaireResponse). Unlike createRuntime(), the form/questionnaire is
  * already known and fixed, so initScript() always succeeds.
  */
-function createRuntimeForQuestionMap(questionMap, language) {
-  const recommendations = [];
+function createRuntimeForQuestionMap(questionMap, language, lifetimeRiskOverrides) {
+  const {
+    recommendations,
+    observations,
+    riskAssessments,
+    setCurrentScriptId,
+    createScriptRecommendation,
+    createScriptReminder,
+    reminderStatistics,
+    createObservation,
+    createRiskAssessment,
+  } = buildRecordingMethods();
   const { libQuestions, libUser } = buildQuestionLibs(() => questionMap, language);
 
   const libEBMEDS = {
-    initScript() {
+    initScript(scriptId) {
+      setCurrentScriptId(scriptId);
       return true;
     },
-    createScriptRecommendation(scriptId, messageNumber, urgency, text) {
-      recommendations.push({
-        scriptId,
-        messageNumber,
-        urgency,
-        text: text === undefined || text === null ? '' : String(text),
-      });
-    },
+    createScriptRecommendation,
+    createScriptReminder,
+    reminderStatistics,
+    createObservation,
+    createRiskAssessment,
   };
 
   return {
     recommendations,
+    observations,
+    riskAssessments,
     libEBMEDS,
     libQuestions,
     libUser,
+    lifetimeRiskService: buildLifetimeRiskService(lifetimeRiskOverrides),
     ...unimplementedLibs(),
   };
 }
